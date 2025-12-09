@@ -7,14 +7,18 @@ batch_size: 128
 env:
   num_services: 6
   num_task_types: 6
-  num_vehicles: 4
-  num_rsus: 2
+  num_vehicles: 6
+  num_rsus: 3
   window: 3
   cache_capacity: 3
   arena_size: 1.0
   veh_speed: 0.05
-  coverage_radius: 0.5
-  reward_weights: [2.0, 1.0, 0.1, 0.2, 1.0]
+  coverage_radius: 0.6
+  reward_weights: [2.0, 1.5, 1.0, 1.0, 0.2]  # [w_cache, w_cost, w_success, w_drop, w_energy_scale]
+  lambda_cache: 0.6
+  rsu_failure_prob: 0.0
+  max_queue_time: 5.0
+  task_to_service: [0, 1, 2, 3, 4, 5]
 
 ggrn:
   samples: 200

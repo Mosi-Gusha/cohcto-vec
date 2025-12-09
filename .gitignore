@@ -10,6 +10,7 @@ env/
 
 # Logs and metrics
 algorithm/logs/
+papers/*.txt
 
 # IDE/editor
 .vscode/

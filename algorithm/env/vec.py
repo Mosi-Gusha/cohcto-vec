@@ -51,6 +51,10 @@ class LRUCache:
         if len(self.store) > self.capacity:
             self.store.popitem(last=False)
 
+    def remove(self, service: int) -> None:
+        if service in self.store:
+            self.store.pop(service, None)
+
     def state_vector(self, num_services: int) -> np.ndarray:
         vec = np.zeros(num_services, dtype=np.float32)
         for s in self.store:
@@ -79,7 +83,11 @@ class VECEnvironment:
         arena_size: float = 1.0,
         veh_speed: float = 0.05,
         coverage_radius: float = 0.5,
-        reward_weights: Tuple[float, float, float, float, float] = (2.0, 1.0, 0.1, 0.2, 1.0),
+        reward_weights: Tuple[float, float, float, float, float] = (2.0, 1.5, 1.0, 1.0, 0.2),
+        task_to_service: Optional[Sequence[int]] = None,
+        lambda_cache: float = 0.6,
+        rsu_failure_prob: float = 0.0,
+        max_queue_time: float = 5.0,
     ) -> None:
         self.rng = random.Random(seed)
         self.ggrn = ggrn
@@ -89,7 +97,7 @@ class VECEnvironment:
         self.num_rsus = num_rsus
         self.window = window
         self.cache_capacity = cache_capacity
-        self.task_to_service = list(range(num_task_types))
+        self.task_to_service = list(task_to_service) if task_to_service is not None else list(range(num_task_types))
         self.arena_size = arena_size
         self.veh_speed = veh_speed
         self.coverage_radius = coverage_radius
@@ -100,7 +108,9 @@ class VECEnvironment:
         self.vehicle_compute = np.full(num_vehicles, 4.0)  # GHz (abstract)
         self.rsu_compute = np.full(num_rsus, 8.0)
         self.cloud_compute = 20.0
-        self.rw_success, self.rw_delay, self.rw_energy, self.rw_cache, self.rw_drop = reward_weights
+        # Reward weights map to paper's Ij/Zj/Dj style: cache hit (w1), cost penalty (w2), success (w3),
+        # drop penalty and optional energy scaling for the cost term.
+        self.w_cache, self.w_cost, self.w_success, self.w_drop, self.w_energy_scale = reward_weights
         self.vehicle_cache: List[LRUCache] = [LRUCache(cache_capacity) for _ in range(num_vehicles)]
         self.rsu_cache: List[LRUCache] = [LRUCache(cache_capacity) for _ in range(num_rsus)]
         self.vehicle_queue_load = np.zeros(num_vehicles, dtype=np.float32)  # accumulated compute time in queue
@@ -113,6 +123,10 @@ class VECEnvironment:
         self.task_location: Dict[str, int] = {}
         self.backhaul_queue = 0.0
         self.handoff_drop_rate = 0.7
+        self.lambda_cache = lambda_cache
+        self.rsu_failure_prob = rsu_failure_prob
+        self.rsu_alive = np.ones(num_rsus, dtype=np.float32)
+        self.max_queue_time = max_queue_time
 
         self.apps: List[ApplicationSpec] = []
         self.tasks_by_id: Dict[str, TaskInstance] = {}
@@ -123,7 +137,8 @@ class VECEnvironment:
         self._service_priority = np.ones(num_services, dtype=np.float32) / num_services
 
         num_targets = self.num_vehicles + self.num_rsus + 1  # +1 cloud
-        self.action_dim = num_targets * 2  # offload target + cache flag
+        # Joint decision: pick offload target, and optional proactive cache RSU (0 = no cache, 1..R).
+        self.action_dim = num_targets * (self.num_rsus + 1)
         self.state_dim = (
             1  # time
             + 2  # deadline ratio + task size
@@ -135,6 +150,8 @@ class VECEnvironment:
             + self.num_vehicles * num_services  # vehicle caches
             + self.num_vehicles  # vehicle queue load
             + self.num_rsus  # RSU queue load
+            + 1  # lambda_cache
+            + self.num_rsus  # rsu alive flags
         )
 
     def reset(self) -> np.ndarray:
@@ -147,6 +164,7 @@ class VECEnvironment:
         self.current_step = 0
         self.task_location.clear()
         self.backhaul_queue = 0.0
+        self.rsu_alive[:] = 1.0
         # Randomize vehicle positions in arena.
         self.vehicle_pos = np.random.rand(*self.vehicle_pos.shape).astype(np.float32) * self.arena_size
         self.vehicle_pos = np.clip(self.vehicle_pos, 0.0, self.arena_size)
@@ -238,10 +256,13 @@ class VECEnvironment:
             _, srv_scores = self.ggrn(list(self.graph_history), self.task_to_service)
             self._service_priority = srv_scores.cpu().numpy()
 
-    def _decode_action(self, action: int) -> Tuple[int, bool]:
-        target = action // 2
-        cache_flag = action % 2 == 1
-        return target, cache_flag
+    def _decode_action(self, action: int) -> Tuple[int, Optional[int]]:
+        num_targets = self.num_vehicles + self.num_rsus + 1
+        per_target = self.num_rsus + 1
+        target = action // per_target
+        cache_slot = action % per_target  # 0 = no cache, >0 cache at rsu_idx
+        cache_rsu = cache_slot - 1 if cache_slot > 0 else None
+        return target, cache_rsu
 
     def _cache_hit(self, service: int, target: int) -> bool:
         # targets: vehicles [0..V-1], RSUs [V..V+R-1], cloud last
@@ -249,15 +270,41 @@ class VECEnvironment:
             return self.vehicle_cache[target].has(service)
         elif target < self.num_vehicles + self.num_rsus:
             rsu_idx = target - self.num_vehicles
+            if self.rsu_alive[rsu_idx] < 0.5:
+                return False
             return self.rsu_cache[rsu_idx].has(service)
         return False
 
-    def _place_cache(self, service: int, target: int, cache_flag: bool) -> None:
-        if cache_flag and target < self.num_vehicles + self.num_rsus:
-            if target < self.num_vehicles:
-                self.vehicle_cache[target].put(service)
-            else:
-                self.rsu_cache[target - self.num_vehicles].put(service)
+    def _place_cache(self, service: int, cache_rsu: Optional[int]) -> None:
+        if cache_rsu is not None and 0 <= cache_rsu < self.num_rsus and self.rsu_alive[cache_rsu] >= 0.5:
+            self._rsu_put_with_priority(cache_rsu, service, self._service_priority[service])
+
+    def _rsu_put_with_priority(self, rsu_idx: int, service: int, priority: float) -> None:
+        cache = self.rsu_cache[rsu_idx]
+        if cache.has(service):
+            return
+        # Evict the lowest-priority cached service if capacity full.
+        if len(cache.store) >= cache.capacity:
+            if cache.store:
+                # pick min priority among cached services
+                min_svc = min(cache.store.keys(), key=lambda s: self._service_priority[s])
+                cache.remove(min_svc)
+        cache.put(service)
+
+    def _bundle_prefetch(self, rsu_idx: int, bundle_size: int = 1) -> None:
+        """Proactively cache top critical services not already cached."""
+        if bundle_size <= 0 or self.rsu_alive[rsu_idx] < 0.5:
+            return
+        cached = set(self.rsu_cache[rsu_idx].store.keys())
+        sorted_services = np.argsort(-self._service_priority)
+        added = 0
+        for svc in sorted_services:
+            if svc in cached:
+                continue
+            self._rsu_put_with_priority(rsu_idx, int(svc), self._service_priority[int(svc)])
+            added += 1
+            if added >= bundle_size:
+                break
 
     def _next_ready_task(self) -> Optional[TaskInstance]:
         if not self.ready_queue:
@@ -311,6 +358,8 @@ class VECEnvironment:
                 veh_state,
                 vehicle_util,
                 rsu_util,
+                np.array([self.lambda_cache], dtype=np.float32),
+                self.rsu_alive.astype(np.float32),
             ]
         )
         return state
@@ -373,6 +422,8 @@ class VECEnvironment:
             uplink_bw = self._link_rate(target, task.vehicle_id)
             queue_wait = self.rsu_queue_load[rsu_idx]
             backhaul = 0.0
+            if self.rsu_alive[rsu_idx] < 0.5:
+                return float("inf"), float("inf"), 0.0, 0.0, True
         else:
             compute_power = self.cloud_compute
             uplink_bw = self._link_rate(target, task.vehicle_id)
@@ -384,6 +435,8 @@ class VECEnvironment:
         dep_delay = self._parent_transfer_delay(task, target)
         dropped, outage_delay = self._handoff_drop(task.vehicle_id, target)
         total_delay = tx_time + queue_wait + compute_time + backhaul + deploy_delay + dep_delay + outage_delay
+        if queue_wait > self.max_queue_time:
+            dropped = True
         energy = 0.1 * compute_time + 0.05 * task.size + 0.02 * deploy_delay
         # Update queues to reflect enqueued work.
         if target < self.num_vehicles:
@@ -404,10 +457,24 @@ class VECEnvironment:
         delta = (np.random.rand(*self.vehicle_pos.shape) - 0.5) * 2 * self.veh_speed
         self.vehicle_pos = np.clip(self.vehicle_pos + delta, 0.0, self.arena_size)
 
+    def _maybe_fail_rsus(self) -> None:
+        """Simulate RSU failures; failed RSU clears cache and stops service."""
+        for idx in range(self.num_rsus):
+            if self.rsu_alive[idx] < 0.5:
+                # Allow simple recovery chance to rejoin service.
+                if self.rsu_failure_prob > 0 and self.rng.random() < (self.rsu_failure_prob * 0.1):
+                    self.rsu_alive[idx] = 1.0
+                continue
+            if self.rsu_failure_prob > 0 and self.rng.random() < self.rsu_failure_prob:
+                self.rsu_alive[idx] = 0.0
+                self.rsu_cache[idx] = LRUCache(self.cache_capacity)
+                self.rsu_queue_load[idx] = 0.0
+
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
         if not self.ready_queue:
             return self._build_state(), 0.0, True, {}
-        target, cache_flag = self._decode_action(action)
+        self._maybe_fail_rsus()
+        target, cache_rsu = self._decode_action(action)
         task = self._next_ready_task()
         if task is None:
             return self._build_state(), 0.0, True, {}
@@ -420,30 +487,28 @@ class VECEnvironment:
         # Active caching at RSU based on predicted criticality and observed frequency.
         if target >= self.num_vehicles and target < self.num_vehicles + self.num_rsus:
             rsu_idx = target - self.num_vehicles
-            priority = 0.6 * self._service_priority[task.service_id] + 0.4 * (
-                self.service_freq[task.service_id] / max(1.0, self.service_freq.sum())
-            )
-            if priority > 0.2:
-                self.rsu_cache[rsu_idx].put(task.service_id)
+            freq_ratio = self.service_freq[task.service_id] / max(1.0, self.service_freq.sum())
+            priority = self.lambda_cache * self._service_priority[task.service_id] + (1.0 - self.lambda_cache) * freq_ratio
+            if priority > 0.2 and self.rsu_alive[rsu_idx] >= 0.5:
+                self._rsu_put_with_priority(rsu_idx, task.service_id, priority)
+                if priority > 0.6:
+                    self._bundle_prefetch(rsu_idx, bundle_size=1)
                 # Cooperative push to another RSU when highly critical.
                 if priority > 0.5 and self.num_rsus > 1:
                     alt = 0 if rsu_idx != 0 else 1
-                    self.rsu_cache[alt].put(task.service_id)
+                    if self.rsu_alive[alt] >= 0.5:
+                        self._rsu_put_with_priority(alt, task.service_id, priority)
 
-        # Reactive caching (LRU) on vehicles if chosen and flag set.
-        self._place_cache(task.service_id, target, cache_flag)
+        # Proactive caching to a chosen RSU (joint decision).
+        self._place_cache(task.service_id, cache_rsu)
 
-        # Reward weights roughly aligned to paper: prioritize deadline success, penalize delay heavily, smaller energy term.
-        delay_penalty = delay / max(task.deadline, 1e-3)
-        energy_penalty = energy
-        drop_penalty = 1.0 if dropped else 0.0
-        reward = (
-            self.rw_success * success
-            + self.rw_cache * (1.0 if cache_hit else 0.0)
-            - self.rw_delay * delay_penalty
-            - self.rw_energy * energy_penalty
-            - self.rw_drop * drop_penalty
-        )
+        # Reward aligned to paper's Ij/Zj/Dj decomposition.
+        cache_term = self.w_cache * (1.0 if cache_hit else 0.0)
+        delay_norm = delay / max(task.deadline, 1e-3)
+        cost_term = self.w_cost * (delay_norm + self.w_energy_scale * energy)
+        success_term = self.w_success * success
+        drop_term = self.w_drop * (1.0 if dropped else 0.0)
+        reward = cache_term - cost_term + success_term - drop_term
 
         # Mark task completion and move children into ready queue when parents done.
         for child_id in task.children:
@@ -481,6 +546,12 @@ class VECEnvironment:
             "tx_time": tx_time,
             "deploy_delay": deploy_delay,
             "dropped": dropped,
+            "reward_terms": {
+                "cache": cache_term,
+                "cost": cost_term,
+                "success": success_term,
+                "drop": drop_term,
+            },
         }
 
     def get_graph_data(self) -> List[Tuple[GraphSnapshot, torch.Tensor]]:
