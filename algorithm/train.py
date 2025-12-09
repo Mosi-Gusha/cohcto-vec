@@ -34,22 +34,53 @@ def pretrain_ggrn(env_cfg: dict, ggrn_cfg: dict, device: str) -> GGRN:
     window = ggrn_cfg.get("window", env_cfg.get("window", 3))
     samples = ggrn_cfg.get("samples", 200)
     epochs = ggrn_cfg.get("epochs", 5)
-    task_to_service = list(range(num_task_types))
+    task_to_service = list(env_cfg.get("task_to_service") or range(num_task_types))
     ggrn = GGRN(num_task_types=num_task_types, num_services=num_services)
-    dataset = SyntheticGGRNDataset(
-        num_samples=samples,
-        window=window,
-        num_task_types=num_task_types,
-        num_services=num_services,
-        task_to_service=task_to_service,
-        seed=0,
-    )
+    dataset_path = ggrn_cfg.get("dataset_path")
+
+    class _ListDataset(torch.utils.data.Dataset):
+        def __init__(self, data):
+            self.data = data
+
+        def __len__(self):
+            return len(self.data)
+
+        def __getitem__(self, idx):
+            return self.data[idx]
+
+    if dataset_path:
+        path = Path(dataset_path)
+        if path.exists():
+            loaded = torch.load(path)
+            dataset = _ListDataset(loaded)
+            print(f"[GGRN] loaded dataset from {path} ({len(dataset)} samples)")
+        else:
+            print(f"[GGRN] dataset_path {path} not found, falling back to synthetic data")
+            dataset = SyntheticGGRNDataset(
+                num_samples=samples,
+                window=window,
+                num_task_types=num_task_types,
+                num_services=num_services,
+                task_to_service=task_to_service,
+                seed=0,
+            )
+    else:
+        dataset = SyntheticGGRNDataset(
+            num_samples=samples,
+            window=window,
+            num_task_types=num_task_types,
+            num_services=num_services,
+            task_to_service=task_to_service,
+            seed=0,
+        )
+
+    validate_folds = int(ggrn_cfg.get("validate_folds", 0))
     opt = torch.optim.Adam(ggrn.parameters(), lr=ggrn_cfg.get("lr", 1e-3))
     loss_fn = torch.nn.MSELoss()
     ggrn.to(device)
-    for epoch in range(epochs):
+    def _run_epoch(ds, tag: str = ""):
         total_loss = 0.0
-        for snaps, target in dataset:
+        for snaps, target in ds:
             snaps = [GraphSnapshot(adj=s.adj.to(device), x=s.x.to(device)) for s in snaps]
             target = target.to(device)
             _, pred = ggrn(snaps, task_to_service)
@@ -58,7 +89,27 @@ def pretrain_ggrn(env_cfg: dict, ggrn_cfg: dict, device: str) -> GGRN:
             loss.backward()
             opt.step()
             total_loss += loss.item()
-        print(f"[GGRN] epoch {epoch+1}/{epochs} loss {total_loss/len(dataset):.4f}")
+        print(f"[GGRN]{tag} loss {total_loss/len(ds):.4f}")
+
+    for epoch in range(epochs):
+        _run_epoch(dataset, tag=f" epoch {epoch+1}/{epochs}")
+    if validate_folds > 1 and len(dataset) >= validate_folds:
+        data_list = list(dataset)
+        fold_size = len(data_list) // validate_folds
+        with torch.no_grad():
+            for k in range(validate_folds):
+                start = k * fold_size
+                end = start + fold_size
+                val_slice = data_list[start:end]
+                if len(val_slice) == 0:
+                    continue
+                total = 0.0
+                for snaps, target in val_slice:
+                    snaps = [GraphSnapshot(adj=s.adj.to(device), x=s.x.to(device)) for s in snaps]
+                    target = target.to(device)
+                    _, pred = ggrn(snaps, task_to_service)
+                    total += loss_fn(pred, target).item()
+                print(f"[GGRN] fold {k+1}/{validate_folds} val_loss {total/len(val_slice):.4f}")
     return ggrn
 
 
@@ -75,6 +126,7 @@ def build_env(env_cfg: dict, ggrn: GGRN) -> VECEnvironment:
         veh_speed=env_cfg.get("veh_speed", 0.05),
         coverage_radius=env_cfg.get("coverage_radius", 0.5),
         reward_weights=tuple(env_cfg.get("reward_weights", (2.0, 1.0, 0.1, 0.2, 1.0))),
+        task_to_service=env_cfg.get("task_to_service"),
     )
 
 
@@ -105,7 +157,21 @@ def train_cohcto(cfg: dict) -> None:
     if not metrics_file.exists():
         with metrics_file.open("w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["episode", "avg_delay", "avg_energy", "hit_rate", "success_rate", "reward", "steps"])
+            writer.writerow(
+                [
+                    "episode",
+                    "avg_delay",
+                    "avg_energy",
+                    "hit_rate",
+                    "success_rate",
+                    "reward",
+                    "steps",
+                    "r_cache",
+                    "r_cost",
+                    "r_success",
+                    "r_drop",
+                ]
+            )
 
     for ep in range(episodes):
         state = env.reset()
@@ -117,6 +183,7 @@ def train_cohcto(cfg: dict) -> None:
         hits = 0
         total_tasks = 0
         successes = 0
+        r_cache = r_cost = r_success = r_drop = 0.0
         while not done:
             action, logprob, value = agent.select_action(state)
             next_state, reward, done, info = env.step(action)
@@ -129,6 +196,11 @@ def train_cohcto(cfg: dict) -> None:
             hits += 1 if info.get("cache_hit") else 0
             successes += 1 if info.get("success") else 0
             total_tasks += 1
+            terms = info.get("reward_terms") or {}
+            r_cache += terms.get("cache", 0.0)
+            r_cost += terms.get("cost", 0.0)
+            r_success += terms.get("success", 0.0)
+            r_drop += terms.get("drop", 0.0)
         loss = agent.update(batch_size=cfg.get("batch_size", 128), epochs=5)
         avg_delay = sum(delays) / max(len(delays), 1)
         avg_energy = sum(energies) / max(len(energies), 1)
@@ -136,7 +208,21 @@ def train_cohcto(cfg: dict) -> None:
         success_rate = successes / max(total_tasks, 1)
         with metrics_file.open("a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([ep + 1, avg_delay, avg_energy, hit_rate, success_rate, ep_reward, steps])
+            writer.writerow(
+                [
+                    ep + 1,
+                    avg_delay,
+                    avg_energy,
+                    hit_rate,
+                    success_rate,
+                    ep_reward,
+                    steps,
+                    r_cache / max(steps, 1),
+                    r_cost / max(steps, 1),
+                    r_success / max(steps, 1),
+                    r_drop / max(steps, 1),
+                ]
+            )
         print(
             "[COHCTO] "
             f"ep {ep+1}/{episodes} reward {ep_reward:.2f} steps {steps} "
@@ -229,7 +315,25 @@ def train_pd3qn(cfg: dict) -> None:
     if not metrics_file.exists():
         with metrics_file.open("w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["episode", "avg_delay", "avg_energy", "hit_rate", "success_rate", "reward", "steps", "epsilon", "beta", "loss", "td_error"])
+            writer.writerow(
+                [
+                    "episode",
+                    "avg_delay",
+                    "avg_energy",
+                    "hit_rate",
+                    "success_rate",
+                    "reward",
+                    "steps",
+                    "epsilon",
+                    "beta",
+                    "loss",
+                    "td_error",
+                    "r_cache",
+                    "r_cost",
+                    "r_success",
+                    "r_drop",
+                ]
+            )
 
     for ep in range(episodes):
         state = env.reset()
@@ -242,6 +346,7 @@ def train_pd3qn(cfg: dict) -> None:
         total_tasks = 0
         successes = 0
         done = False
+        r_cache = r_cost = r_success = r_drop = 0.0
         while not done:
             action = agent.select_action(state)
             next_state, reward, done, info = env.step(action)
@@ -263,6 +368,11 @@ def train_pd3qn(cfg: dict) -> None:
             total_tasks += 1
             steps += 1
             last_stats = agent.train_step(batch_size=batch_size) or last_stats
+            terms = info.get("reward_terms") or {}
+            r_cache += terms.get("cache", 0.0)
+            r_cost += terms.get("cost", 0.0)
+            r_success += terms.get("success", 0.0)
+            r_drop += terms.get("drop", 0.0)
 
         beta = last_stats.beta if last_stats else agent._current_beta()
         loss_val = last_stats.loss if last_stats else 0.0
@@ -273,7 +383,25 @@ def train_pd3qn(cfg: dict) -> None:
         success_rate = successes / max(total_tasks, 1)
         with metrics_file.open("a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([ep + 1, avg_delay, avg_energy, hit_rate, success_rate, ep_reward, steps, agent.epsilon, beta, loss_val, td_err])
+            writer.writerow(
+                [
+                    ep + 1,
+                    avg_delay,
+                    avg_energy,
+                    hit_rate,
+                    success_rate,
+                    ep_reward,
+                    steps,
+                    agent.epsilon,
+                    beta,
+                    loss_val,
+                    td_err,
+                    r_cache / max(steps, 1),
+                    r_cost / max(steps, 1),
+                    r_success / max(steps, 1),
+                    r_drop / max(steps, 1),
+                ]
+            )
         print(
             f"[P-D3QN:VEC] "
             f"ep {ep+1:04d}/{episodes} reward {ep_reward:.2f} steps {steps} "

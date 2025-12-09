@@ -44,14 +44,15 @@ def _longest_path_cost(g: nx.DiGraph, duration: Dict[str, float]) -> Dict[str, f
 
 def assign_topology_priorities(
     apps: Iterable[ApplicationSpec],
-    alpha: float = 0.6,
-    beta: float = 0.4,
+    alpha_app: float = 0.4,
+    alpha_work: float = 0.4,
+    alpha_crit_path: float = 0.2,
 ) -> Dict[Tuple[str, str], PriorityInfo]:
     """
-    Closer mapping to Algorithm 2:
-    - Application weight proportional to 1/deadline.
-    - Task priority blends critical path urgency (alpha) and fan-out importance (beta).
-    - Local deadlines allocated along longest paths then tightened by precedence.
+    Closer mapping to Algorithm 2 (formulas 31/32):
+    - Application weight ω_aq ∝ 1/deadline (normalized).
+    - Task priority blends: application weight, normalized work (ϕ), critical-path indicator Γ.
+    - Local deadlines allocated by work share then tightened by priority.
     Returns:
         Mapping (app_id, task_id) -> PriorityInfo(priority, local_deadline)
     """
@@ -76,16 +77,32 @@ def assign_topology_priorities(
 
         longest = _longest_path_cost(g, duration)
         max_path = max(longest.values())
-        # Task structural importance approximates formulas (31)/(32): combine longest-path share and out-degree.
+        # Mark tasks on a critical path (Γ).
+        crit_nodes: set[str] = set()
+        if max_path > 0:
+            for node in g.nodes:
+                if abs(longest[node] - max_path) < 1e-6:
+                    crit_nodes.add(node)
+
+        work_sum = sum(duration.values())
         task_priority: Dict[str, float] = {}
         for node in g.nodes:
-            share = (longest[node] / max_path) if max_path > 0 else 0.0
-            fanout = g.out_degree(node)
-            task_priority[node] = app_pri_norm[app.app_id] * (alpha * share + beta * (1 + fanout))
+            work_share = duration[node] / work_sum if work_sum > 0 else 0.0
+            gamma_cp = 1.0 if node in crit_nodes else 0.0
+            task_priority[node] = (
+                alpha_app * app_pri_norm[app.app_id]
+                + alpha_work * work_share
+                + alpha_crit_path * gamma_cp
+            )
 
-        # Local deadline allocation proportional to longest-path share.
+        # Local deadline allocation per (32): base on work share then tightened by priority.
+        base_deadline = {
+            node: app.deadline * (duration[node] / work_sum) if work_sum > 0 else app.deadline
+            for node in g.nodes
+        }
+        pri_sum = sum(task_priority.values()) or 1.0
         raw_deadline = {
-            node: app.deadline * (longest[node] / max_path) if max_path > 0 else app.deadline
+            node: base_deadline[node] * (1.0 - task_priority[node] / pri_sum)
             for node in g.nodes
         }
         # Enforce precedence: child deadline >= parent.
