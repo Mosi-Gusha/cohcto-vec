@@ -64,6 +64,8 @@ class PPOAgent:
         lam: float = 0.95,
         clip_eps: float = 0.2,
         lr: float = 3e-4,
+        actor_lr: float | None = None,
+        critic_lr: float | None = None,
         entropy_coef: float = 0.01,
         value_coef: float = 0.5,
         device: str | torch.device = "cpu",
@@ -75,7 +77,17 @@ class PPOAgent:
         self.value_coef = value_coef
         self.device = torch.device(device)
         self.model = ActorCritic(state_dim, action_dim).to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        if actor_lr is None and critic_lr is None:
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        else:
+            actor_lr = actor_lr or lr
+            critic_lr = critic_lr or lr
+            self.optimizer = torch.optim.Adam(
+                [
+                    {"params": self.model.policy.parameters(), "lr": actor_lr},
+                    {"params": self.model.value.parameters(), "lr": critic_lr},
+                ]
+            )
         self.buffer = RolloutBuffer()
 
     def select_action(self, state: np.ndarray) -> Tuple[int, float, float]:

@@ -82,12 +82,21 @@ class VECEnvironment:
         seed: int = 0,
         arena_size: float = 1.0,
         veh_speed: float = 0.05,
+        veh_speed_range_kmh: Optional[Sequence[float]] = None,
         coverage_radius: float = 0.5,
         reward_weights: Tuple[float, float, float, float, float] = (2.0, 1.5, 1.0, 1.0, 0.2),
         task_to_service: Optional[Sequence[int]] = None,
         lambda_cache: float = 0.6,
         rsu_failure_prob: float = 0.0,
         max_queue_time: float = 5.0,
+        max_steps: int = 20,
+        vehicle_compute_range: Optional[Sequence[float]] = None,
+        rsu_compute_range: Optional[Sequence[float]] = None,
+        task_work_range: Optional[Sequence[float]] = None,
+        task_size_range: Optional[Sequence[float]] = None,
+        app_deadline_range: Optional[Sequence[float]] = None,
+        vehicle_cache_capacity: Optional[int] = None,
+        rsu_cache_capacity: Optional[int] = None,
     ) -> None:
         self.rng = random.Random(seed)
         self.ggrn = ggrn
@@ -97,22 +106,32 @@ class VECEnvironment:
         self.num_rsus = num_rsus
         self.window = window
         self.cache_capacity = cache_capacity
+        self.vehicle_cache_capacity = vehicle_cache_capacity or cache_capacity
+        self.rsu_cache_capacity = rsu_cache_capacity or cache_capacity
         self.task_to_service = list(task_to_service) if task_to_service is not None else list(range(num_task_types))
         self.arena_size = arena_size
         self.veh_speed = veh_speed
+        self.veh_speed_range_kmh = veh_speed_range_kmh
         self.coverage_radius = coverage_radius
         self.vehicle_pos = np.zeros((num_vehicles, 2), dtype=np.float32)
-        self.rsu_pos = np.linspace(0.2, 0.8, num_rsus).reshape(-1, 1)
-        self.rsu_pos = np.hstack([self.rsu_pos, np.full((num_rsus, 1), 0.5, dtype=np.float32)])
+        rsu_x = np.linspace(0.2, 0.8, num_rsus).reshape(-1, 1) * self.arena_size
+        rsu_y = np.full((num_rsus, 1), 0.5 * self.arena_size, dtype=np.float32)
+        self.rsu_pos = np.hstack([rsu_x, rsu_y])
+        self.vehicle_speed = np.full(num_vehicles, self.veh_speed, dtype=np.float32)
 
+        self.vehicle_compute_range = vehicle_compute_range or (2.0, 3.0)
+        self.rsu_compute_range = rsu_compute_range or (3.0, 6.0)
         self.vehicle_compute = np.full(num_vehicles, 4.0)  # GHz (abstract)
         self.rsu_compute = np.full(num_rsus, 8.0)
         self.cloud_compute = 20.0
+        self.task_work_range = task_work_range or (1.0, 10.0)
+        self.task_size_range = task_size_range or (0.5, 2.0)
+        self.app_deadline_range = app_deadline_range or (15.0, 15.0)
         # Reward weights map to paper's Ij/Zj/Dj style: cache hit (w1), cost penalty (w2), success (w3),
         # drop penalty and optional energy scaling for the cost term.
         self.w_cache, self.w_cost, self.w_success, self.w_drop, self.w_energy_scale = reward_weights
-        self.vehicle_cache: List[LRUCache] = [LRUCache(cache_capacity) for _ in range(num_vehicles)]
-        self.rsu_cache: List[LRUCache] = [LRUCache(cache_capacity) for _ in range(num_rsus)]
+        self.vehicle_cache: List[LRUCache] = [LRUCache(self.vehicle_cache_capacity) for _ in range(num_vehicles)]
+        self.rsu_cache: List[LRUCache] = [LRUCache(self.rsu_cache_capacity) for _ in range(num_rsus)]
         self.vehicle_queue_load = np.zeros(num_vehicles, dtype=np.float32)  # accumulated compute time in queue
         self.rsu_queue_load = np.zeros(num_rsus, dtype=np.float32)
         self.cloud_queue_load = 0.0
@@ -127,13 +146,13 @@ class VECEnvironment:
         self.rsu_failure_prob = rsu_failure_prob
         self.rsu_alive = np.ones(num_rsus, dtype=np.float32)
         self.max_queue_time = max_queue_time
+        self.max_steps = max_steps
 
         self.apps: List[ApplicationSpec] = []
         self.tasks_by_id: Dict[str, TaskInstance] = {}
         self.pending_tasks: List[TaskInstance] = []
         self.ready_queue: List[TaskInstance] = []
         self.current_step = 0
-        self.max_steps = 20
         self._service_priority = np.ones(num_services, dtype=np.float32) / num_services
 
         num_targets = self.num_vehicles + self.num_rsus + 1  # +1 cloud
@@ -155,8 +174,8 @@ class VECEnvironment:
         )
 
     def reset(self) -> np.ndarray:
-        self.vehicle_cache = [LRUCache(self.cache_capacity) for _ in range(self.num_vehicles)]
-        self.rsu_cache = [LRUCache(self.cache_capacity) for _ in range(self.num_rsus)]
+        self.vehicle_cache = [LRUCache(self.vehicle_cache_capacity) for _ in range(self.num_vehicles)]
+        self.rsu_cache = [LRUCache(self.rsu_cache_capacity) for _ in range(self.num_rsus)]
         self.vehicle_queue_load[:] = 0
         self.rsu_queue_load[:] = 0
         self.cloud_queue_load = 0.0
@@ -165,6 +184,21 @@ class VECEnvironment:
         self.task_location.clear()
         self.backhaul_queue = 0.0
         self.rsu_alive[:] = 1.0
+        # Sample compute capacities within configured ranges.
+        self.vehicle_compute = np.random.uniform(
+            self.vehicle_compute_range[0], self.vehicle_compute_range[1], size=self.num_vehicles
+        ).astype(np.float32)
+        self.rsu_compute = np.random.uniform(
+            self.rsu_compute_range[0], self.rsu_compute_range[1], size=self.num_rsus
+        ).astype(np.float32)
+        # Sample vehicle speeds if range provided (km/h -> m/s).
+        if self.veh_speed_range_kmh:
+            min_kmh, max_kmh = self.veh_speed_range_kmh
+            min_mps = min_kmh * 1000.0 / 3600.0
+            max_mps = max_kmh * 1000.0 / 3600.0
+            self.vehicle_speed = np.random.uniform(min_mps, max_mps, size=self.num_vehicles).astype(np.float32)
+        else:
+            self.vehicle_speed = np.full(self.num_vehicles, self.veh_speed, dtype=np.float32)
         # Randomize vehicle positions in arena.
         self.vehicle_pos = np.random.rand(*self.vehicle_pos.shape).astype(np.float32) * self.arena_size
         self.vehicle_pos = np.clip(self.vehicle_pos, 0.0, self.arena_size)
@@ -187,14 +221,14 @@ class VECEnvironment:
         num_apps = self.rng.randint(2, 4)
         snapshots: List[Tuple[GraphSnapshot, torch.Tensor]] = []
         for app_idx in range(num_apps):
-            deadline = self.rng.uniform(4.0, 8.0)
+            deadline = self.rng.uniform(self.app_deadline_range[0], self.app_deadline_range[1])
             num_tasks = self.rng.randint(3, 6)
             tasks: List[TaskSpec] = []
             for t_idx in range(num_tasks):
                 task_id = f"t{app_idx}_{t_idx}"
                 service_id = self.rng.randrange(self.num_services)
-                work = self.rng.uniform(5.0, 15.0)
-                size = self.rng.uniform(0.5, 2.0)
+                work = self.rng.uniform(self.task_work_range[0], self.task_work_range[1])
+                size = self.rng.uniform(self.task_size_range[0], self.task_size_range[1])
                 parents = [f"t{app_idx}_{p}" for p in range(t_idx) if self.rng.random() < 0.3]
                 tasks.append(TaskSpec(task_id, service_id, work, size, parents))
             apps.append(ApplicationSpec(app_id=f"a{app_idx}", deadline=deadline, tasks=tasks))
@@ -316,7 +350,8 @@ class VECEnvironment:
             return np.zeros(self.state_dim, dtype=np.float32)
         task = self.ready_queue[0]
         time_feat = np.array([self.current_step / max(self.max_steps - 1, 1)], dtype=np.float32)
-        deadline_ratio = np.array([task.deadline / 10.0], dtype=np.float32)
+        max_deadline = max(self.app_deadline_range[1], 1.0)
+        deadline_ratio = np.array([task.deadline / max_deadline], dtype=np.float32)
         size_feat = np.array([task.size / 3.0], dtype=np.float32)
         topo_feat = np.array(
             [
@@ -454,7 +489,7 @@ class VECEnvironment:
         self.rsu_queue_load = np.maximum(0.0, self.rsu_queue_load - timeslot)
         self.cloud_queue_load = max(0.0, self.cloud_queue_load - timeslot)
         # Move vehicles randomly to emulate mobility.
-        delta = (np.random.rand(*self.vehicle_pos.shape) - 0.5) * 2 * self.veh_speed
+        delta = (np.random.rand(*self.vehicle_pos.shape) - 0.5) * 2 * self.vehicle_speed[:, None] * timeslot
         self.vehicle_pos = np.clip(self.vehicle_pos + delta, 0.0, self.arena_size)
 
     def _maybe_fail_rsus(self) -> None:
@@ -467,7 +502,7 @@ class VECEnvironment:
                 continue
             if self.rsu_failure_prob > 0 and self.rng.random() < self.rsu_failure_prob:
                 self.rsu_alive[idx] = 0.0
-                self.rsu_cache[idx] = LRUCache(self.cache_capacity)
+                self.rsu_cache[idx] = LRUCache(self.rsu_cache_capacity)
                 self.rsu_queue_load[idx] = 0.0
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
@@ -501,6 +536,9 @@ class VECEnvironment:
 
         # Proactive caching to a chosen RSU (joint decision).
         self._place_cache(task.service_id, cache_rsu)
+        # Reactive caching on vehicles after successful local execution.
+        if target < self.num_vehicles and not dropped:
+            self.vehicle_cache[target].put(task.service_id)
 
         # Reward aligned to paper's Ij/Zj/Dj decomposition.
         cache_term = self.w_cache * (1.0 if cache_hit else 0.0)
@@ -543,6 +581,7 @@ class VECEnvironment:
             "energy": energy,
             "success": success,
             "cache_hit": cache_hit,
+            "target": target,
             "tx_time": tx_time,
             "deploy_delay": deploy_delay,
             "dropped": dropped,
