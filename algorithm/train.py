@@ -35,7 +35,12 @@ def pretrain_ggrn(env_cfg: dict, ggrn_cfg: dict, device: str) -> GGRN:
     samples = ggrn_cfg.get("samples", 200)
     epochs = ggrn_cfg.get("epochs", 5)
     task_to_service = list(env_cfg.get("task_to_service") or range(num_task_types))
-    ggrn = GGRN(num_task_types=num_task_types, num_services=num_services)
+    ggrn = GGRN(
+        num_task_types=num_task_types,
+        num_services=num_services,
+        hidden_dim=ggrn_cfg.get("gcn_hidden_dim", 64),
+        gru_hidden=ggrn_cfg.get("gru_hidden_dim", None),
+    )
     dataset_path = ggrn_cfg.get("dataset_path")
 
     class _ListDataset(torch.utils.data.Dataset):
@@ -127,6 +132,15 @@ def build_env(env_cfg: dict, ggrn: GGRN) -> VECEnvironment:
         coverage_radius=env_cfg.get("coverage_radius", 0.5),
         reward_weights=tuple(env_cfg.get("reward_weights", (2.0, 1.0, 0.1, 0.2, 1.0))),
         task_to_service=env_cfg.get("task_to_service"),
+        max_steps=env_cfg.get("max_steps", 20),
+        veh_speed_range_kmh=env_cfg.get("veh_speed_range_kmh"),
+        vehicle_compute_range=env_cfg.get("vehicle_compute_range"),
+        rsu_compute_range=env_cfg.get("rsu_compute_range"),
+        task_work_range=env_cfg.get("task_work_range"),
+        task_size_range=env_cfg.get("task_size_range"),
+        app_deadline_range=env_cfg.get("app_deadline_range"),
+        vehicle_cache_capacity=env_cfg.get("vehicle_cache_capacity"),
+        rsu_cache_capacity=env_cfg.get("rsu_cache_capacity"),
     )
 
 
@@ -146,6 +160,9 @@ def train_cohcto(cfg: dict) -> None:
         gamma=algo_cfg.get("gamma", 0.95),
         lam=algo_cfg.get("lam", 0.9),
         lr=algo_cfg.get("lr", 3e-4),
+        actor_lr=algo_cfg.get("actor_lr"),
+        critic_lr=algo_cfg.get("critic_lr"),
+        clip_eps=algo_cfg.get("clip_eps", 0.2),
         entropy_coef=algo_cfg.get("entropy_coef", 0.01),
         value_coef=algo_cfg.get("value_coef", 0.5),
     )
@@ -181,6 +198,7 @@ def train_cohcto(cfg: dict) -> None:
         delays: List[float] = []
         energies: List[float] = []
         hits = 0
+        cache_tasks = 0
         total_tasks = 0
         successes = 0
         r_cache = r_cost = r_success = r_drop = 0.0
@@ -194,6 +212,9 @@ def train_cohcto(cfg: dict) -> None:
             delays.append(info.get("delay", 0.0))
             energies.append(info.get("energy", 0.0))
             hits += 1 if info.get("cache_hit") else 0
+            target = info.get("target")
+            if target is not None and target < env.num_vehicles + env.num_rsus:
+                cache_tasks += 1
             successes += 1 if info.get("success") else 0
             total_tasks += 1
             terms = info.get("reward_terms") or {}
@@ -201,10 +222,11 @@ def train_cohcto(cfg: dict) -> None:
             r_cost += terms.get("cost", 0.0)
             r_success += terms.get("success", 0.0)
             r_drop += terms.get("drop", 0.0)
-        loss = agent.update(batch_size=cfg.get("batch_size", 128), epochs=5)
+        mini_batch = cfg.get("mini_batch_size", cfg.get("batch_size", 128))
+        loss = agent.update(batch_size=mini_batch, epochs=5)
         avg_delay = sum(delays) / max(len(delays), 1)
         avg_energy = sum(energies) / max(len(energies), 1)
-        hit_rate = hits / max(total_tasks, 1)
+        hit_rate = hits / max(cache_tasks, 1)
         success_rate = successes / max(total_tasks, 1)
         with metrics_file.open("a", newline="") as f:
             writer = csv.writer(f)
@@ -343,6 +365,7 @@ def train_pd3qn(cfg: dict) -> None:
         delays: List[float] = []
         energies: List[float] = []
         hits = 0
+        cache_tasks = 0
         total_tasks = 0
         successes = 0
         done = False
@@ -364,6 +387,9 @@ def train_pd3qn(cfg: dict) -> None:
             delays.append(info.get("delay", 0.0))
             energies.append(info.get("energy", 0.0))
             hits += 1 if info.get("cache_hit") else 0
+            target = info.get("target")
+            if target is not None and target < env.num_vehicles + env.num_rsus:
+                cache_tasks += 1
             successes += 1 if info.get("success") else 0
             total_tasks += 1
             steps += 1
@@ -379,7 +405,7 @@ def train_pd3qn(cfg: dict) -> None:
         td_err = last_stats.td_error if last_stats else 0.0
         avg_delay = sum(delays) / max(len(delays), 1)
         avg_energy = sum(energies) / max(len(energies), 1)
-        hit_rate = hits / max(total_tasks, 1)
+        hit_rate = hits / max(cache_tasks, 1)
         success_rate = successes / max(total_tasks, 1)
         with metrics_file.open("a", newline="") as f:
             writer = csv.writer(f)
